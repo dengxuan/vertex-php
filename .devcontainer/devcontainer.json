@@ -1,0 +1,22 @@
+{
+    "name": "vertex-php (Swoole)",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "bmewburn.vscode-intelephense-client",
+                "xdebug.php-debug"
+            ],
+            "settings": {
+                "php.validate.executablePath": "/usr/local/bin/php"
+            }
+        }
+    },
+    // Install dev dependencies and verify the toolchain when the container
+    // comes up. Everything this SDK needs to build and test itself is in the
+    // image — no sibling repos, no .NET. Cross-language interop (compat/hello)
+    // is the Vertex spec repo's concern, run from there.
+    "postCreateCommand": "composer install && php -v && php -m | grep -i swoole && protoc --version"
+}

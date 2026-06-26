@@ -1,0 +1,7 @@
+# Vendored protos come from the spec repo with LF endings; the drift check
+# re-fetches them with LF, so force LF here or git's autocrlf would make the
+# working copy CRLF and false-positive the diff.
+*.proto text eol=lf
+# Shell scripts must stay LF — they run under bash in CI and via Git Bash locally.
+*.sh text eol=lf
+scripts/.spec-ref text eol=lf

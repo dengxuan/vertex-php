@@ -1,0 +1,55 @@
+{
+    "name": "dengxuan/vertex-php",
+    "description": "PHP (Swoole) implementation of Vertex. Wire format and transport contract are defined by the Vertex spec repo (dengxuan/Vertex), pinned via scripts/.spec-ref.",
+    "type": "library",
+    "license": "MIT",
+    "version": "0.1.0",
+    "require": {
+        "php": ">=8.2",
+        "ext-swoole": "*",
+        "google/protobuf": "^4.0 || ^5.0"
+    },
+    "require-dev": {
+        "friendsofphp/php-cs-fixer": "^3.40",
+        "phpstan/phpstan": "^1.10",
+        "phpunit/phpunit": "^10.5"
+    },
+    "autoload": {
+        "psr-4": {
+            "Vertex\\": "src/",
+            "Vertex\\Compat\\Hello\\": "generated/Vertex/Compat/Hello/",
+            "GPBMetadata\\": "generated/GPBMetadata/"
+        }
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Vertex\\Tests\\": "tests/"
+        }
+    },
+    "scripts": {
+        "test": "phpunit",
+        "lint": "php-cs-fixer fix --dry-run --diff",
+        "fix": "php-cs-fixer fix",
+        "analyse": "phpstan analyse src --level=6",
+        "check": [
+            "@lint",
+            "@analyse",
+            "@test"
+        ],
+        "sync-protos": "bash scripts/sync-protos.sh"
+    },
+    "scripts-descriptions": {
+        "test": "Run the PHPUnit unit tests.",
+        "lint": "Check code style (php-cs-fixer, no changes made).",
+        "fix": "Apply code-style fixes in place.",
+        "analyse": "Run PHPStan static analysis on src/.",
+        "check": "Run lint + analyse + test — the full local gate before pushing.",
+        "sync-protos": "Re-vendor protos from the pinned spec SHA and regenerate message classes."
+    },
+    "config": {
+        "sort-packages": true,
+        "platform": {
+            "php": "8.2.0"
+        }
+    }
+}

@@ -1,0 +1,63 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Verify vendored protos match pinned spec SHA
+        run: |
+          # --check-only skips protoc regeneration. Generated PHP files embed
+          # local protoc + grpc_php_plugin versions in their headers, which
+          # drift between CI and dev machines and false-positive this check.
+          # We trust devs to run `bash scripts/sync-protos.sh` (without the flag)
+          # locally whenever they bump scripts/.spec-ref; CI only guards that the
+          # vendored .proto file tracks the pinned spec SHA.
+          bash scripts/sync-protos.sh --check-only
+          if ! git diff --quiet --exit-code -- protos; then
+            echo "::error::Vendored .proto drifted from pinned spec SHA."
+            echo "Run bash scripts/sync-protos.sh locally and commit; update scripts/.spec-ref if a spec bump is intended."
+            git diff -- protos
+            exit 1
+          fi
+
+      - name: Check for PHP package
+        id: haveCode
+        run: |
+          if [ -f composer.json ] && [ -d src ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No composer.json + src/ yet — skipping install/test. Expected during initial bootstrap."
+          fi
+
+      - uses: shivammathur/setup-php@v2
+        if: steps.haveCode.outputs.present == 'true'
+        with:
+          php-version: '8.3'
+          # swoole is the runtime the SDK targets; protobuf for the message
+          # classes. The transport is hand-written, so no grpc extension.
+          extensions: swoole, protobuf
+          coverage: none
+
+      - name: Install dependencies
+        if: steps.haveCode.outputs.present == 'true'
+        run: composer install --prefer-dist --no-progress
+
+      - name: Test
+        if: steps.haveCode.outputs.present == 'true'
+        run: composer test
