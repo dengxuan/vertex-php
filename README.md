@@ -89,24 +89,35 @@ from there, not here.
 
 ## Status
 
-**Stage 1 (transport + wire) and Stage 2 (RPC) — implemented and verified.**
+**Stages 1–2 (transport, wire, RPC) and Stage 4 (reconnect) — implemented and verified.**
 
 - `src/Messaging/Envelope.php` — 4-frame wire encode/decode (spec §2)
 - `src/Transport/Grpc/GrpcClientTransport.php` — Swoole HTTP/2 gRPC bidi client
   honoring the four invariants. Send-loop + recv-loop architecture (the read
   side uses `usePipelineRead` so streamed responses arrive on a long-lived
   bidi stream); frame reassembly in `src/Transport/Grpc/FrameReassembler.php`.
+  **Auto-reconnect** with exponential backoff + jitter
+  (`src/Transport/Grpc/ReconnectPolicy.php`, default 1s→30s ±20%, matching
+  vertex-dotnet) and `onPeerConnectionChanged` Connected/Disconnected events.
 - `src/Serialization/ProtobufSerializer.php` — protobuf payloads + canonical
   topic from the descriptor full name
 - `src/Messaging/MessagingChannel.php` — events (`publish()` / `subscribe()`)
   **and RPC (`invoke()` / `handle()`)**: request/response over the 4-frame
   envelope, 32-hex request_id, error responses (`!`-topic + UTF-8), peer-
-  disconnect grace period. Exceptions in `src/Messaging/Rpc/`.
+  disconnect grace period (fails pending invokes on the Disconnected event).
+  Exceptions in `src/Messaging/Rpc/`.
 
-Verified: php-cs-fixer + phpstan level 6 + 28 unit tests green; interop against
+Verified: php-cs-fixer + phpstan level 6 + 37 unit tests green; interop against
 the .NET server in the spec repo — `compat/hello` (event), `compat/hello-rpc`
 (RPC), and `compat/bidi-echo` (a bounded long-lived bidi smoke: ~145k round-
-trips in 30s, 0 failures, concurrent bursts with no interleave).
+trips in 30s, 0 failures, concurrent bursts with no interleave). Reconnect was
+verified by killing and restarting the server mid-run (auto-recovered).
+
+> **Reconnect covers graceful drops** (server restart / rolling deploy — the
+> peer sends GOAWAY/FIN, detected immediately). A *hard* disconnect (peer crash
+> / network cut with no close) is currently only noticed when the OS TCP stack
+> gives up; a read-idle timeout to surface it as a read-loop timeout (per
+> transport-contract invariant #4) is a planned enhancement.
 
 **gRPC is client-only — by design, not a gap.** PHP cannot host a *bidirectional*
 gRPC server: Swoole's HTTP/2 server buffers the request body until the client
@@ -115,7 +126,7 @@ the wider PHP ecosystem agrees — grpc.io says "use another language to create 
 gRPC server"). A PHP peer that must *be called* will use the ZeroMQ transport
 (below), not gRPC.
 
-**Not yet implemented (later stages):** reconnect policy, ZeroMQ transport
+**Not yet implemented (later stages):** ZeroMQ transport
 (incl. the Router role for being called), peer-authentication, MessagePack
 serializer.
 

@@ -11,8 +11,11 @@ use Swoole\Coroutine;
 use Swoole\Coroutine\Channel;
 use Swoole\Coroutine\Http2\Client as Http2Client;
 use Swoole\Http2\Request as Http2Request;
+use Vertex\Transport\PeerConnectionEvent;
+use Vertex\Transport\PeerConnectionState;
 use Vertex\Transport\TransportInterface;
 use Vertex\Transport\TransportMessage;
+use Vertex\Transport\TransportSendException;
 
 /**
  * Client-side Vertex gRPC bidi transport, built on Swoole's coroutine HTTP/2
@@ -94,22 +97,40 @@ final class GrpcClientTransport implements TransportInterface
      */
     private Channel $writeLock;
 
-    /** Signaled once by the recv loop on exit (flush-before-close, see close()). */
+    /** Signaled by the recv loop on each exit (flush-before-close + reconnect). */
     private Channel $recvDone;
+
+    /**
+     * 1-capacity channel connect() blocks on for the first connection result:
+     * true on first success, or a \Throwable to rethrow on terminal first-
+     * connect failure. Pushed exactly once by the run loop.
+     */
+    private Channel $firstConnect;
+
+    /** Pushed by close() to wake the run loop out of a backoff sleep. */
+    private Channel $closeSignal;
+
+    /** @var list<callable(PeerConnectionEvent): void> peer-connection subscribers */
+    private array $peerHandlers = [];
+
+    /** Last state delivered to subscribers; replayed to late ones. Null until first connect. */
+    private ?PeerConnectionState $lastState = null;
 
     private bool $connected = false;
     private bool $closed = false;
 
     /**
-     * @param string $serverAddr host:port of the Vertex gRPC server
-     * @param string $authority   :authority pseudo-header (defaults to serverAddr)
-     * @param float  $sendTimeout seconds to wait for the write lock before send() throws
+     * @param string          $serverAddr host:port of the Vertex gRPC server
+     * @param string          $authority   :authority pseudo-header (defaults to serverAddr)
+     * @param float           $sendTimeout seconds to wait for the write lock before send() throws
+     * @param ReconnectPolicy $reconnect   backoff policy; default 1s→30s ±20%
      */
     public function __construct(
         private readonly string $serverAddr,
         ?string $name = null,
         private readonly string $authority = '',
         private readonly float $sendTimeout = 5.0,
+        private readonly ReconnectPolicy $reconnect = new ReconnectPolicy(),
     ) {
         $this->name = $name ?? $serverAddr;
         $this->codec = new TransportFrameCodec();
@@ -117,6 +138,8 @@ final class GrpcClientTransport implements TransportInterface
         $this->sendCh = new Channel(1);
         $this->sendRet = new Channel(1);
         $this->recvDone = new Channel(1);
+        $this->firstConnect = new Channel(1);
+        $this->closeSignal = new Channel(1);
         $this->writeLock = new Channel(1);
         $this->writeLock->push(true); // unlocked
     }
@@ -132,22 +155,131 @@ final class GrpcClientTransport implements TransportInterface
      */
     public function connect(): void
     {
+        // The send loop owns the client write side for the transport's whole
+        // life, across reconnects; start it once. It reads $this->client each
+        // iteration, so reconnect just swaps the field.
+        Coroutine::create(fn () => $this->sendLoop());
+
+        // The run loop drives connect → read → disconnect → backoff → reconnect.
+        Coroutine::create(fn () => $this->runLoop());
+
+        // Block until the first connection succeeds (or fails terminally), so
+        // that after connect() returns, send() has a live stream — mirrors
+        // vertex-dotnet's _firstConnectTcs.
+        $first = $this->firstConnect->pop();
+        if ($first instanceof \Throwable) {
+            throw $first;
+        }
+    }
+
+    public function name(): string
+    {
+        return $this->name;
+    }
+
+    public function receive(): Channel
+    {
+        return $this->inbound;
+    }
+
+    public function onPeerConnectionChanged(callable $handler): void
+    {
+        $this->peerHandlers[] = $handler;
+
+        // Replay the current state so a late subscriber doesn't miss the
+        // connection it's already on (mirrors vertex-dotnet's replay).
+        if ($this->lastState !== null) {
+            $this->invokePeerHandler($handler, new PeerConnectionEvent($this->serverAddr, $this->lastState));
+        }
+    }
+
+    /**
+     * Drives the transport's whole life: connect, run the read loop until the
+     * peer drops, raise Connected/Disconnected, then back off and reconnect per
+     * the policy. The SOLE source of connection-liveness judgment (invariant
+     * #4). Exits only on close() or when reconnect is disabled after a drop.
+     */
+    private function runLoop(): void
+    {
+        $attempt = 0;
+        $everConnected = false;
+
+        while (!$this->closed) {
+            try {
+                $this->connectOnce();
+                $attempt = 0; // success resets backoff
+                $this->connected = true;
+                if (!$everConnected) {
+                    $everConnected = true;
+                    $this->firstConnect->push(true);
+                }
+                $this->raisePeerEvent(PeerConnectionState::Connected);
+
+                // Blocks until the peer drops (recv loop pushes $recvDone on exit).
+                $this->recvLoop();
+
+                // We were connected and just lost it: raise Disconnected exactly
+                // once on the Connected→Disconnected edge. A *failed reconnect
+                // attempt* (the catch below) must NOT re-raise it — mirrors
+                // vertex-dotnet, which only emits on a real drop.
+                $this->connected = false;
+                $this->teardownClient();
+                $this->raisePeerEvent(PeerConnectionState::Disconnected);
+            } catch (\Throwable $e) {
+                // Connect/open failure (initial or a reconnect attempt). Never
+                // emits Disconnected — we weren't connected this cycle. If we've
+                // never connected and won't retry, surface it to connect().
+                $this->connected = false;
+                $this->teardownClient();
+                if (!$everConnected && !$this->reconnect->enabled) {
+                    $this->firstConnect->push($e);
+
+                    return;
+                }
+            }
+
+            if ($this->closed || !$this->reconnect->enabled) {
+                break;
+            }
+
+            // Back off, then reconnect. Sleep on $closeSignal so close() during a
+            // backoff window wakes us immediately instead of waiting it out.
+            ++$attempt;
+            if ($this->closeSignal->pop($this->reconnect->backoffFor($attempt)) !== false) {
+                break; // close() pushed the signal
+            }
+        }
+
+        // Never connected and gave up (reconnect disabled) — unblock connect().
+        if (!$everConnected) {
+            $this->firstConnect->push(new TransportSendException(
+                \sprintf('vertex grpc: could not connect to %s', $this->serverAddr)
+            ));
+        }
+
+        // No more inbound after the run loop ends.
+        $this->inbound->close();
+    }
+
+    /**
+     * Open one fresh connection + bidi stream, populating $client / $streamId.
+     * Throws on any failure so runLoop() can back off and retry.
+     */
+    private function connectOnce(): void
+    {
         [$host, $port] = $this->splitAddr($this->serverAddr);
 
-        $this->client = new Http2Client($host, $port);
-        $this->client->set([
+        $client = new Http2Client($host, $port);
+        $client->set([
             'timeout' => -1,            // the stream is long-lived; no overall timeout
             'open_http2_protocol' => true,
         ]);
-        if (!$this->client->connect()) {
-            throw new \RuntimeException(
-                \sprintf('vertex grpc: connect %s failed: %s', $this->serverAddr, $this->client->errMsg)
+        if (!$client->connect()) {
+            throw new TransportSendException(
+                \sprintf('vertex grpc: connect %s failed: %s', $this->serverAddr, $client->errMsg)
             );
         }
-
-        // The send loop owns the write side; start it before opening the stream
-        // so the open itself goes through the same single-writer coroutine.
-        Coroutine::create(fn () => $this->sendLoop());
+        $this->client = $client;
 
         // Open the bidi stream: one long-lived HTTP/2 request. pipeline keeps the
         // request (send) side open for streaming writes; usePipelineRead makes
@@ -171,25 +303,43 @@ final class GrpcClientTransport implements TransportInterface
 
         $streamId = $this->submit($req);
         if ($streamId === false || $streamId <= 0) {
-            throw new \RuntimeException(
+            throw new TransportSendException(
                 \sprintf('vertex grpc: open stream on %s failed: %s', $this->serverAddr, $this->client->errMsg)
             );
         }
         $this->streamId = $streamId;
-        $this->connected = true;
-
-        // Invariant #4: the recv loop is the sole owner of connection liveness.
-        Coroutine::create(fn () => $this->recvLoop());
     }
 
-    public function name(): string
+    /** Close the current connection's client between reconnect attempts. */
+    private function teardownClient(): void
     {
-        return $this->name;
+        if (isset($this->client)) {
+            @$this->client->close();
+        }
     }
 
-    public function receive(): Channel
+    /**
+     * Deliver a peer-connection state change to every subscriber and record it
+     * for replay. Handlers are isolated: a thrower doesn't break the others or
+     * the run loop (invariant #2 in spirit — one handler's failure is not fatal).
+     */
+    private function raisePeerEvent(PeerConnectionState $state): void
     {
-        return $this->inbound;
+        $this->lastState = $state;
+        $event = new PeerConnectionEvent($this->serverAddr, $state);
+        foreach ($this->peerHandlers as $handler) {
+            $this->invokePeerHandler($handler, $event);
+        }
+    }
+
+    /** @param callable(PeerConnectionEvent): void $handler */
+    private function invokePeerHandler(callable $handler, PeerConnectionEvent $event): void
+    {
+        try {
+            $handler($event);
+        } catch (\Throwable) {
+            // Swallow: a subscriber's failure must not disturb the transport.
+        }
     }
 
     /**
@@ -206,18 +356,25 @@ final class GrpcClientTransport implements TransportInterface
     public function send(string $target, array $frames): void
     {
         if ($this->closed) {
-            throw new \RuntimeException('vertex grpc: transport closed');
+            throw new TransportSendException('vertex grpc: transport closed');
         }
 
         // Acquire the write lock — invariant #3's one legitimate cancel point.
         $token = $this->writeLock->pop($this->sendTimeout);
         if ($token === false) {
-            throw new \RuntimeException('vertex grpc: timed out acquiring write lock');
+            throw new TransportSendException('vertex grpc: timed out acquiring write lock');
         }
 
         try {
+            // Disconnected (e.g. mid-reconnect backoff): fail just this send,
+            // immediately, without waiting for the peer to come back — mirrors
+            // vertex-dotnet, which throws TransportSendException here rather than
+            // blocking. A caller may retry once the peer reconnects.
             if (!$this->connected) {
-                throw new \RuntimeException('vertex grpc: not connected');
+                throw new TransportSendException(\sprintf(
+                    'vertex grpc: not connected to %s (reconnecting)',
+                    $this->serverAddr
+                ));
             }
 
             $last = \count($frames) - 1;
@@ -229,7 +386,7 @@ final class GrpcClientTransport implements TransportInterface
                 // half-close it only in close() via CloseSend semantics.
                 $ok = $this->submit([$this->streamId, $grpcFramed, false]);
                 if ($ok === false) {
-                    throw new \RuntimeException(\sprintf(
+                    throw new TransportSendException(\sprintf(
                         'vertex grpc: write frame %d/%d failed: %s',
                         $i + 1,
                         $last + 1,
@@ -257,25 +414,26 @@ final class GrpcClientTransport implements TransportInterface
         }
         $this->closed = true;
 
-        // Half-close client→server through the send loop: an empty DATA frame
-        // with end_stream=true, ordered behind any frames already queued. A
-        // publish-then-close does not lose the envelope's tail.
-        if ($this->connected) {
-            $this->submit([$this->streamId, '', true]);
-        }
+        // Wake the run loop if it's mid-backoff between reconnects.
+        $this->closeSignal->push(true);
 
-        // Wait for the recv loop to drain to the server's response-side close
-        // before tearing down. Swoole buffers writes; closing the socket while
-        // just-written frames are still in flight RST_STREAMs the connection and
-        // the server never sees them. Bounded so a wedged peer can't hang close().
         if ($this->connected) {
+            // Half-close client→server through the send loop: an empty DATA frame
+            // with end_stream=true, ordered behind any frames already queued, so a
+            // publish-then-close does not lose the envelope's tail.
+            $this->submit([$this->streamId, '', true]);
+
+            // Wait for the recv loop to drain to the server's response-side close
+            // before tearing down. Swoole buffers writes; closing the socket while
+            // just-written frames are in flight RST_STREAMs the connection and the
+            // server never sees them. Bounded so a wedged peer can't hang close().
             $this->recvDone->pop(self::CLOSE_DRAIN_TIMEOUT);
         }
 
-        // Stop the send loop (it owns the client write side and closes the
-        // socket on exit), then unblock anything still waiting on inbound.
+        // Stop the send loop (it owns the client write side and closes the socket
+        // on exit). The run loop sees $closed, exits, and closes $inbound — the
+        // sole inbound-close site, so callers blocked on receive() unblock once.
         $this->sendCh->close();
-        $this->inbound->close();
     }
 
     /**
@@ -337,6 +495,15 @@ final class GrpcClientTransport implements TransportInterface
 
         try {
             while (!$this->closed) {
+                // recv(-1) blocks until a frame, a clean close (GOAWAY/FIN), or a
+                // socket error. KNOWN LIMITATION: a *hard* disconnect (peer crash
+                // / network cut with no GOAWAY) is only noticed when the OS TCP
+                // stack gives up (minutes). Graceful disconnects — server restart,
+                // rolling deploy — are detected immediately and reconnect works.
+                // Future: bounded-timeout recv + a read-idle threshold to surface
+                // dead connections as a read timeout (spec transport-contract §
+                // invariant #4: "heartbeat should surface as a read-loop read
+                // timeout, not a parallel source of truth").
                 $response = $this->client->recv(-1);
                 if ($response === false) {
                     // recv failure / stream end — the sole legitimate disconnect
@@ -358,8 +525,13 @@ final class GrpcClientTransport implements TransportInterface
                 }
             }
         } finally {
-            // Unblock close()'s flush-before-close wait on every exit path.
-            $this->recvDone->push(true);
+            // Unblock close()'s flush-before-close wait. Only push when close()
+            // is the reason we're exiting — on a plain disconnect (reconnect
+            // path) nobody pops $recvDone, and a second push would block the
+            // next cycle's recv loop on the 1-capacity channel.
+            if ($this->closed) {
+                $this->recvDone->push(true);
+            }
         }
     }
 
