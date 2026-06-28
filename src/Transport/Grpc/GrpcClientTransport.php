@@ -125,12 +125,27 @@ final class GrpcClientTransport implements TransportInterface
      * @param float           $sendTimeout seconds to wait for the write lock before send() throws
      * @param ReconnectPolicy $reconnect   backoff policy; default 1s→30s ±20%
      */
+    /**
+     * @param string                       $serverAddr  host:port of the Vertex gRPC server
+     * @param string                       $authority   :authority pseudo-header (defaults to serverAddr)
+     * @param float                        $sendTimeout seconds to wait for the write lock before send() throws
+     * @param ReconnectPolicy              $reconnect   backoff policy; default 1s→30s ±20%
+     * @param array<string,string>|callable():array<string,string> $metadata
+     *        connect-time gRPC metadata (HTTP/2 headers) merged into the bidi
+     *        request, e.g. ['x-merchant-id' => '...', 'x-signature' => '...'] for
+     *        connection-level auth. Reserved/pseudo headers (:authority,
+     *        content-type, te, user-agent) cannot be overridden. Pass a callable
+     *        to recompute the headers on every (re)connect — lets rotating
+     *        credentials refresh without rebuilding the transport. The caller
+     *        signs; the transport only carries the headers.
+     */
     public function __construct(
         private readonly string $serverAddr,
         ?string $name = null,
         private readonly string $authority = '',
         private readonly float $sendTimeout = 5.0,
         private readonly ReconnectPolicy $reconnect = new ReconnectPolicy(),
+        private readonly mixed $metadata = [],
     ) {
         $this->name = $name ?? $serverAddr;
         $this->codec = new TransportFrameCodec();
@@ -288,12 +303,7 @@ final class GrpcClientTransport implements TransportInterface
         $req = new Http2Request();
         $req->method = 'POST';
         $req->path = self::METHOD_PATH;
-        $req->headers = [
-            'content-type' => 'application/grpc+proto',
-            'te' => 'trailers',
-            ':authority' => $this->authority !== '' ? $this->authority : $this->serverAddr,
-            'user-agent' => 'vertex-php/0.1 swoole',
-        ];
+        $req->headers = $this->buildHeaders();
         $req->pipeline = true;
         // Real Swoole runtime property (Swoole >= 4.5.3); the static stubs omit
         // it, so phpstan can't see it. Without it recv() buffers until end-of-
@@ -308,6 +318,52 @@ final class GrpcClientTransport implements TransportInterface
             );
         }
         $this->streamId = $streamId;
+    }
+
+    /** Reserved/pseudo headers the caller's metadata may not override. */
+    private const RESERVED_HEADERS = ['content-type', 'te', ':authority', 'user-agent'];
+
+    /**
+     * Build the bidi request headers: the caller's connect metadata first, then
+     * the reserved headers on top so they always win. Resolved fresh on every
+     * (re)connect — a callable $metadata is invoked here, so rotating
+     * credentials refresh without rebuilding the transport.
+     *
+     * @return array<string,string>
+     */
+    private function buildHeaders(): array
+    {
+        $metadata = \is_callable($this->metadata) ? ($this->metadata)() : $this->metadata;
+        $authority = $this->authority !== '' ? $this->authority : $this->serverAddr;
+
+        return self::mergeHeaders($metadata, $authority);
+    }
+
+    /**
+     * Merge caller metadata under the reserved headers (reserved always win).
+     * Pure and static so the precedence rules are unit-testable without a
+     * connection.
+     *
+     * @param array<string,string> $metadata
+     * @return array<string,string>
+     */
+    public static function mergeHeaders(array $metadata, string $authority): array
+    {
+        $headers = [];
+        foreach ($metadata as $key => $value) {
+            // Drop any attempt to set a reserved header; the framework owns those.
+            if (!\in_array(\strtolower((string) $key), self::RESERVED_HEADERS, true)) {
+                $headers[(string) $key] = (string) $value;
+            }
+        }
+
+        // Reserved headers last so they overwrite anything the caller slipped in.
+        $headers['content-type'] = 'application/grpc+proto';
+        $headers['te'] = 'trailers';
+        $headers[':authority'] = $authority;
+        $headers['user-agent'] = 'vertex-php/0.1 swoole';
+
+        return $headers;
     }
 
     /** Close the current connection's client between reconnect attempts. */
