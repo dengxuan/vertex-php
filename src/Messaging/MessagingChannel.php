@@ -13,6 +13,8 @@ use Vertex\Messaging\Rpc\RpcPeerDisconnectedException;
 use Vertex\Messaging\Rpc\RpcRemoteException;
 use Vertex\Messaging\Rpc\RpcTimeoutException;
 use Vertex\Serialization\SerializerInterface;
+use Vertex\Transport\PeerConnectionEvent;
+use Vertex\Transport\PeerConnectionState;
 use Vertex\Transport\TransportInterface;
 
 /**
@@ -69,6 +71,15 @@ final class MessagingChannel
         // Invariant #1 lives in the transport's read loop; here we only consume
         // the already-routed inbound channel and fan out to handlers.
         Coroutine::create(fn () => $this->receiveLoop());
+
+        // Fail pending invokes when the peer drops. With a reconnecting transport
+        // the inbound channel stays open across reconnects, so disconnect is
+        // signalled by this event (invariant #4), not by inbound closing.
+        $this->transport->onPeerConnectionChanged(function (PeerConnectionEvent $e): void {
+            if ($e->state === PeerConnectionState::Disconnected) {
+                $this->failPendingOnDisconnect();
+            }
+        });
     }
 
     public function name(): string
@@ -237,9 +248,10 @@ final class MessagingChannel
         while (!$this->closed) {
             $msg = $inbound->pop();
             if ($msg === false) {
-                // Channel closed → the read loop reported the peer gone. This
-                // is the only place a disconnect is concluded (invariant #4).
-                $this->failPendingOnDisconnect();
+                // Inbound closed → the transport shut down for good (its run loop
+                // ended). A plain disconnect no longer closes inbound (the
+                // transport reconnects); pending invokes are failed by the
+                // PeerConnectionChanged handler, not here. Just exit the loop.
                 break;
             }
 

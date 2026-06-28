@@ -54,6 +54,19 @@ interface TransportInterface
     public function receive(): Channel;
 
     /**
+     * Subscribe to peer-connection liveness changes (Connected / Disconnected).
+     * The messaging layer uses this to fail pending RPC invokes when a peer
+     * goes away. Per invariant #4 only the read loop concludes Disconnected.
+     *
+     * The current state is replayed to a handler at subscription time so a late
+     * subscriber doesn't miss the connection it's already on. Handlers must not
+     * throw; a throwing handler is isolated and logged, never propagated.
+     *
+     * @param callable(PeerConnectionEvent): void $handler
+     */
+    public function onPeerConnectionChanged(callable $handler): void;
+
+    /**
      * Gracefully shut down: half-close the send side so queued outbound frames
      * flush, drain the read loop, then release the connection. Idempotent.
      */
