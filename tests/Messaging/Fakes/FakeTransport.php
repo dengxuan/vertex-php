@@ -9,6 +9,8 @@ namespace Vertex\Tests\Messaging\Fakes;
 
 use Swoole\Coroutine\Channel;
 use Vertex\Messaging\Envelope;
+use Vertex\Transport\PeerConnectionEvent;
+use Vertex\Transport\PeerConnectionState;
 use Vertex\Transport\TransportInterface;
 use Vertex\Transport\TransportMessage;
 
@@ -17,7 +19,7 @@ use Vertex\Transport\TransportMessage;
  * envelopes are decoded and recorded on {@see $sent} so a test can assert what
  * the channel put on the wire; inbound envelopes are injected via {@see deliver()}
  * to drive the channel's receive loop. {@see drop()} simulates a peer disconnect
- * (invariant #4) by closing the inbound channel.
+ * (invariant #4) by raising a Disconnected event.
  */
 final class FakeTransport implements TransportInterface
 {
@@ -25,6 +27,9 @@ final class FakeTransport implements TransportInterface
     public array $sent = [];
 
     private readonly Channel $inbound;
+
+    /** @var list<callable(PeerConnectionEvent): void> */
+    private array $peerHandlers = [];
 
     /** Optional hook run inside send(), e.g. to make a send fail. @var null|callable(Envelope): void */
     public $onSend = null;
@@ -53,6 +58,13 @@ final class FakeTransport implements TransportInterface
         return $this->inbound;
     }
 
+    public function onPeerConnectionChanged(callable $handler): void
+    {
+        $this->peerHandlers[] = $handler;
+        // Replay Connected at subscription time, mirroring a live transport.
+        $handler(new PeerConnectionEvent($this->peer, PeerConnectionState::Connected));
+    }
+
     public function close(): void
     {
         $this->inbound->close();
@@ -64,9 +76,12 @@ final class FakeTransport implements TransportInterface
         $this->inbound->push(new TransportMessage($this->peer, $envelope->encode()));
     }
 
-    /** Simulate the read loop concluding the peer is gone (closes inbound). */
+    /** Simulate the read loop concluding the peer is gone (raises Disconnected). */
     public function drop(): void
     {
-        $this->inbound->close();
+        $event = new PeerConnectionEvent($this->peer, PeerConnectionState::Disconnected);
+        foreach ($this->peerHandlers as $handler) {
+            $handler($event);
+        }
     }
 }

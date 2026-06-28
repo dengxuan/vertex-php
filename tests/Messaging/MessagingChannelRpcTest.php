@@ -183,6 +183,10 @@ final class MessagingChannelRpcTest extends TestCase
             } catch (\Throwable $e) {
                 $caught = $e;
             }
+            // Close so the receive loop's inbound pop() unblocks and the
+            // coroutine exits (drop() no longer closes inbound — it only raises
+            // the Disconnected event).
+            $channel->close();
         });
 
         $this->assertInstanceOf(RpcPeerDisconnectedException::class, $caught);
