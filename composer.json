@@ -3,7 +3,6 @@
     "description": "PHP (Swoole) implementation of Vertex. Wire format and transport contract are defined by the Vertex spec repo (dengxuan/Vertex), pinned via scripts/.spec-ref.",
     "type": "library",
     "license": "MIT",
-    "version": "0.2.0",
     "require": {
         "php": ">=8.2",
         "ext-swoole": "*",

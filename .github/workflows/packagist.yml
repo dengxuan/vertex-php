@@ -1,0 +1,47 @@
+name: Packagist
+
+# Nudges Packagist to refresh the package on every release tag. Packagist's
+# GitHub webhook usually does this automatically, but this is a tag-driven
+# backstop so a freshly cut vX.Y.Z is published even if the webhook is missing
+# or lagging. No-op (skipped) until the repo is registered on packagist.org and
+# the two secrets below are set.
+#
+# Required repo secrets (Settings → Secrets and variables → Actions):
+#   PACKAGIST_USERNAME   — your packagist.org username
+#   PACKAGIST_API_TOKEN  — packagist.org → Profile → Show API Token
+#
+# Until then this workflow harmlessly skips (the `if` guards on the secret).
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger Packagist update
+        env:
+          USERNAME: ${{ secrets.PACKAGIST_USERNAME }}
+          TOKEN: ${{ secrets.PACKAGIST_API_TOKEN }}
+        run: |
+          if [ -z "$USERNAME" ] || [ -z "$TOKEN" ]; then
+            echo "::notice::PACKAGIST_USERNAME / PACKAGIST_API_TOKEN not set — skipping."
+            echo "Register https://github.com/dengxuan/vertex-php on packagist.org and add the secrets to enable auto-publish."
+            exit 0
+          fi
+          # Ask Packagist to re-fetch the package's metadata + tags.
+          http_code=$(curl -sS -o /tmp/resp.json -w '%{http_code}' \
+            -X POST \
+            "https://packagist.org/api/update-package?username=${USERNAME}&apiToken=${TOKEN}" \
+            -H 'Content-Type: application/json' \
+            -d '{"repository":{"url":"https://github.com/dengxuan/vertex-php"}}')
+          echo "Packagist responded ${http_code}"
+          cat /tmp/resp.json || true
+          [ "$http_code" = "200" ] || { echo "::error::Packagist update failed (HTTP ${http_code})"; exit 1; }
+          echo "::notice::Packagist update triggered for $GITHUB_REF_NAME"
