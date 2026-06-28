@@ -89,24 +89,34 @@ from there, not here.
 
 ## Status
 
-**Stage 1 (transport + wire) — code complete, unverified.** Implemented:
+**Stage 1 (transport + wire) and Stage 2 (RPC) — implemented and verified.**
 
 - `src/Messaging/Envelope.php` — 4-frame wire encode/decode (spec §2)
 - `src/Transport/Grpc/GrpcClientTransport.php` — Swoole HTTP/2 gRPC bidi client
-  honoring the four invariants (read loop, send mutex, graceful half-close)
+  honoring the four invariants. Send-loop + recv-loop architecture (the read
+  side uses `usePipelineRead` so streamed responses arrive on a long-lived
+  bidi stream); frame reassembly in `src/Transport/Grpc/FrameReassembler.php`.
 - `src/Serialization/ProtobufSerializer.php` — protobuf payloads + canonical
   topic from the descriptor full name
-- `src/Messaging/MessagingChannel.php` — `publish()` + event `subscribe()`
-- compat scenario: `Vertex/compat/hello/php-client` + `run-php.sh`
+- `src/Messaging/MessagingChannel.php` — events (`publish()` / `subscribe()`)
+  **and RPC (`invoke()` / `handle()`)**: request/response over the 4-frame
+  envelope, 32-hex request_id, error responses (`!`-topic + UTF-8), peer-
+  disconnect grace period. Exceptions in `src/Messaging/Rpc/`.
 
-> ⚠️ **Not yet run end-to-end.** This was authored in an environment with no
-> PHP / Swoole, so it has not been linted, unit-tested, or interop-verified
-> against the .NET server. Treat it as a reviewed draft pending a first run on
-> a box with `php` + `ext-swoole`. The `compat/hello` row for PHP is marked 🚧
-> until `./run-php.sh` passes.
+Verified: php-cs-fixer + phpstan level 6 + 28 unit tests green; interop against
+the .NET server in the spec repo — `compat/hello` (event), `compat/hello-rpc`
+(RPC), and `compat/bidi-echo` (a bounded long-lived bidi smoke: ~145k round-
+trips in 30s, 0 failures, concurrent bursts with no interleave).
 
-**Not yet implemented (later stages):** RPC (`Invoke` / `HandleRequest`),
-reconnect policy, server-side transport, ZeroMQ transport, peer-authentication.
+**gRPC is client-only — by design, not a gap.** PHP cannot host a *bidirectional*
+gRPC server: Swoole's HTTP/2 server buffers the request body until the client
+half-closes, so it can't read a long-lived stream's frames incrementally (and
+the wider PHP ecosystem agrees — grpc.io says "use another language to create a
+gRPC server"). A PHP peer that must *be called* will use the ZeroMQ transport
+(below), not gRPC.
 
-CI skips build/test steps until a `composer.json` + `src/` package exists (both
-now do, but the PHP test job needs a real PHP+Swoole runner image to be useful).
+**Not yet implemented (later stages):** reconnect policy, ZeroMQ transport
+(incl. the Router role for being called), peer-authentication, MessagePack
+serializer.
+
+CI runs build/test on a PHP+Swoole image (composer.json + src/ in place).
